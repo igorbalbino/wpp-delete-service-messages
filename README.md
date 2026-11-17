@@ -6,7 +6,7 @@ A configuração é feita por uma interface web em `http://localhost:3000`. Não
 
 ## Requisitos
 
-- Node.js **18+**
+- Node.js **18+** (testado também com Node 22/26)
 - Conta WhatsApp (será vinculada como dispositivo)
 - A conta conectada precisa ser **administradora** do grupo para apagar mensagens de outros membros
 
@@ -46,16 +46,24 @@ O modo DRY RUN também pode ser alterado pelo painel (fica salvo em `data/config
 
 ## Desenvolvimento
 
-Sobe a API (com reload) e o frontend Vite:
+Sobe **API + frontend Vite no mesmo processo** (uma porta só, sem proxy):
 
 ```bash
 npm run dev
 ```
 
-- API / painel em produção-like: `http://localhost:3000`
-- Frontend Vite (com proxy): `http://localhost:5173`
+Abra: `http://localhost:3000`
 
-Use qualquer uma das URLs; o Vite encaminha `/api` e `/ws` para a API.
+Não use `node --watch` com o Baileys — reiniciar o processo no meio da sessão corrompe chaves Signal (Bad MAC).
+
+Opcional (avançado): API e Vite separados
+
+```bash
+npm run dev:api
+npm run dev:web
+```
+
+Nesse modo o Vite fica em `http://localhost:5173` e faz proxy de `/api` e `/ws`.
 
 ## Build e execução local (produção)
 
@@ -215,6 +223,14 @@ Altere `PORT` no `.env`.
 ### Frontend em branco com `npm start`
 
 Rode `npm run build` antes do `start`, ou use `npm run dev` em desenvolvimento.
+
+### Erro `Bad MAC` / falha ao descriptografar
+
+Geralmente sessão Signal dessincronizada. Desconecte e conecte de novo pelo painel (ou apague a pasta `auth/` e gere um novo QR).
+
+### `[vite] ws proxy socket error: ECONNABORTED`
+
+Só aparece no modo separado (`dev:web`). Prefira `npm run dev` (porta única). No modo separado o aviso é inofensivo quando a API reinicia.
 
 ## Licença
 

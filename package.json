@@ -5,8 +5,8 @@
   "type": "module",
   "private": true,
   "scripts": {
-    "dev": "concurrently -n api,web -c green,cyan \"npm:dev:api\" \"npm:dev:web\"",
-    "dev:api": "node --watch src/index.js",
+    "dev": "node src/index.js --dev",
+    "dev:api": "node src/index.js",
     "dev:web": "npm run dev --prefix web",
     "build": "npm run build --prefix web",
     "start": "node src/index.js",
@@ -28,5 +28,10 @@
   "devDependencies": {
     "concurrently": "^9.1.2",
     "vitest": "^3.0.5"
+  },
+  "allowScripts": {
+    "@whiskeysockets/baileys@6.7.24": true,
+    "esbuild@0.28.2": true,
+    "protobufjs@7.6.5": true
   }
 }

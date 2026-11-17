@@ -1,3 +1,34 @@
+function unwrapMessageContent(content, depth = 0) {
+  if (!content || typeof content !== 'object' || depth > 6) return null;
+  if (content.imageMessage) return content;
+
+  const nested =
+    content.ephemeralMessage?.message ||
+    content.viewOnceMessage?.message ||
+    content.viewOnceMessageV2?.message ||
+    content.viewOnceMessageV2Extension?.message ||
+    content.documentWithCaptionMessage?.message ||
+    content.editedMessage?.message ||
+    content.associatedChildMessage?.message ||
+    null;
+
+  if (nested) return unwrapMessageContent(nested, depth + 1);
+
+  const edited = content.protocolMessage?.editedMessage;
+  if (edited) return unwrapMessageContent(edited, depth + 1);
+
+  return content;
+}
+
+/**
+ * Foto nativa do WhatsApp (incluindo visualização única, temporária e edição).
+ * Não inclui figurinha nem arquivo enviado como documento.
+ */
+export function isImageMessage(message) {
+  const content = unwrapMessageContent(message?.message);
+  return Boolean(content?.imageMessage);
+}
+
 /**
  * Extrai texto útil de uma mensagem Baileys.
  */

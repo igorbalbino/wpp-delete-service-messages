@@ -3,6 +3,8 @@ import QRCode from 'qrcode';
 
 const CATEGORY_LABELS = {
   service: 'Serviço detectado',
+  anuncio: 'Anúncio',
+  image: 'Imagem',
   job: 'Vaga de emprego',
   rental: 'Aluguel',
   sale: 'Venda',
@@ -12,7 +14,8 @@ const CATEGORY_LABELS = {
 
 function actionLabel(action) {
   if (action === 'removed') return { text: 'Removido', className: 'removed' };
-  if (action === 'ignored_dry_run') return { text: 'Ignorado (DRY RUN)', className: 'dry' };
+  if (action === 'ignored_dry_run') return { text: 'Detectado (DRY RUN)', className: 'dry' };
+  if (action === 'kept') return { text: 'Preservado', className: 'kept' };
   return { text: 'Ignorado', className: 'ignored' };
 }
 
@@ -78,12 +81,35 @@ export default function App() {
 
   useEffect(() => {
     let closed = false;
-    let socket;
-    let retryTimer;
+    let socket = null;
+    let retryTimer = null;
+    let retryMs = 1000;
+
+    const clearRetry = () => {
+      if (retryTimer) {
+        clearTimeout(retryTimer);
+        retryTimer = null;
+      }
+    };
 
     const connectWs = () => {
-      socket = new WebSocket(wsUrl());
-      socket.onmessage = (event) => {
+      clearRetry();
+      if (closed) return;
+
+      try {
+        socket?.close();
+      } catch {
+        // ignore
+      }
+
+      const next = new WebSocket(wsUrl());
+      socket = next;
+
+      next.onopen = () => {
+        retryMs = 1000;
+      };
+
+      next.onmessage = (event) => {
         try {
           const payload = JSON.parse(event.data);
           if (payload.type === 'status') setStatus(payload.data);
@@ -92,10 +118,16 @@ export default function App() {
           // ignore
         }
       };
-      socket.onclose = () => {
-        if (!closed) {
-          retryTimer = setTimeout(connectWs, 2000);
-        }
+
+      next.onerror = () => {
+        // onclose cuida do retry
+      };
+
+      next.onclose = () => {
+        if (closed) return;
+        clearRetry();
+        retryTimer = setTimeout(connectWs, retryMs);
+        retryMs = Math.min(retryMs * 1.5, 8000);
       };
     };
 
@@ -110,8 +142,12 @@ export default function App() {
 
     return () => {
       closed = true;
-      clearTimeout(retryTimer);
-      socket?.close();
+      clearRetry();
+      try {
+        socket?.close();
+      } catch {
+        // ignore
+      }
     };
   }, []);
 
@@ -187,27 +223,41 @@ export default function App() {
     }
   }
 
-  async function handleSaveGroup() {
-    if (!selectedGroup) {
+  async function saveGroup(groupJid) {
+    if (!groupJid) {
       setError('Selecione um grupo.');
       return;
     }
     setBusy(true);
     setError(null);
     try {
-      const group = groups.find((g) => g.jid === selectedGroup);
+      const group = groups.find((g) => g.jid === groupJid);
       await api('/api/group', {
         method: 'POST',
         body: JSON.stringify({
-          groupJid: selectedGroup,
+          groupJid,
           groupName: group?.name,
         }),
       });
-      setMessage('✓ Grupo salvo');
+      setMessage('✓ Grupo salvo — monitoramento ativo. Envie uma mensagem no grupo para testar.');
     } catch (err) {
       setError(err.message);
     } finally {
       setBusy(false);
+    }
+  }
+
+  async function handleSaveGroup() {
+    await saveGroup(selectedGroup);
+  }
+
+  async function handleGroupChange(event) {
+    const groupJid = event.target.value;
+    setSelectedGroup(groupJid);
+    setMessage(null);
+    setError(null);
+    if (groupJid) {
+      await saveGroup(groupJid);
     }
   }
 
@@ -218,6 +268,21 @@ export default function App() {
       await api('/api/config', {
         method: 'PATCH',
         body: JSON.stringify({ dryRun: next }),
+      });
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleDeleteImagesToggle(next) {
+    setBusy(true);
+    setError(null);
+    try {
+      await api('/api/config', {
+        method: 'PATCH',
+        body: JSON.stringify({ deleteImages: next }),
       });
     } catch (err) {
       setError(err.message);
@@ -364,7 +429,8 @@ export default function App() {
               <select
                 className="select"
                 value={selectedGroup}
-                onChange={(e) => setSelectedGroup(e.target.value)}
+                disabled={busy}
+                onChange={handleGroupChange}
               >
                 <option value="">Selecione um grupo</option>
                 {groups.map((g) => (
@@ -374,7 +440,7 @@ export default function App() {
                 ))}
               </select>
               <div className="row">
-                <button className="btn btn-primary" disabled={busy} onClick={handleSaveGroup}>
+                <button className="btn btn-primary" disabled={busy || !selectedGroup} onClick={handleSaveGroup}>
                   Salvar
                 </button>
                 <button className="btn btn-secondary" disabled={busy} onClick={refreshGroups}>
@@ -383,8 +449,10 @@ export default function App() {
               </div>
               {status.group && (
                 <div className="banner ok">
-                  ✓ Grupo salvo
-                  <div style={{ marginTop: 4 }}>Grupo monitorado: {status.group.name}</div>
+                  ✓ Monitorando: {status.group.name}
+                  <div style={{ marginTop: 4 }}>
+                    Mensagens do grupo aparecem em Atividade recente.
+                  </div>
                 </div>
               )}
             </>
@@ -392,7 +460,7 @@ export default function App() {
         </section>
 
         <section className="card stack">
-          <h2>Modo de teste</h2>
+          <h2>Regras</h2>
           <div className="toggle">
             <div>
               <div style={{ fontWeight: 700 }}>
@@ -414,6 +482,27 @@ export default function App() {
               Ativo
             </label>
           </div>
+          <div className={`toggle ${status?.deleteImages ? 'danger' : 'neutral'}`}>
+            <div>
+              <div style={{ fontWeight: 700 }}>
+                {status?.deleteImages ? 'APAGAR IMAGENS' : 'IMAGENS PRESERVADAS'}
+              </div>
+              <div style={{ fontSize: '0.9rem', marginTop: 4 }}>
+                {status?.deleteImages
+                  ? 'Qualquer foto é apagada na hora, sem ler a legenda. As suas mensagens continuam no chat.'
+                  : 'Fotos só são analisadas se tiverem legenda.'}
+              </div>
+            </div>
+            <label>
+              <input
+                type="checkbox"
+                checked={Boolean(status?.deleteImages)}
+                disabled={busy || !status}
+                onChange={(e) => handleDeleteImagesToggle(e.target.checked)}
+              />
+              Ativo
+            </label>
+          </div>
         </section>
 
         <section className="card stack span-2">
@@ -421,7 +510,10 @@ export default function App() {
           {message && <div className="banner ok">{message}</div>}
           {error && <div className="banner warn">{error}</div>}
           {activity.length === 0 ? (
-            <p className="empty">Nenhuma atividade registrada ainda.</p>
+            <p className="empty">
+              Nenhuma atividade ainda. Com o grupo salvo, envie uma mensagem no WhatsApp —
+              ela deve aparecer aqui mesmo se for preservada.
+            </p>
           ) : (
             <ul className="activity">
               {activity.map((item) => {
@@ -429,7 +521,18 @@ export default function App() {
                 return (
                   <li key={item.id}>
                     <span className="time">{formatTime(item.time)}</span>
-                    <span>{CATEGORY_LABELS[item.category] || item.category}</span>
+                    <div className="activity-body">
+                      <div className="activity-top">
+                        <span>{CATEGORY_LABELS[item.category] || item.category}</span>
+                        {item.fromMe ? <span className="muted"> (sua mensagem)</span> : null}
+                      </div>
+                      {item.preview ? (
+                        <div className="activity-preview">“{item.preview}”</div>
+                      ) : null}
+                      {item.reason ? (
+                        <div className="activity-reason muted">{item.reason}</div>
+                      ) : null}
+                    </div>
                     <span className={`pill ${action.className}`}>{action.text}</span>
                   </li>
                 );

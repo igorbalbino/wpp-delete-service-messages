@@ -11,7 +11,7 @@ import {
 } from './storage/storage.js';
 import { whatsappClient } from './whatsapp/client.js';
 
-export function createServer() {
+export async function createServer() {
   const app = express();
   const server = http.createServer(app);
   const wss = new WebSocketServer({ server, path: '/ws' });
@@ -22,7 +22,11 @@ export function createServer() {
     const data = JSON.stringify(payload);
     for (const client of wss.clients) {
       if (client.readyState === 1) {
-        client.send(data);
+        try {
+          client.send(data);
+        } catch {
+          // ignore broken sockets
+        }
       }
     }
   };
@@ -41,21 +45,27 @@ export function createServer() {
     pushStatus().catch(() => {});
   });
 
-  // Allow monitor to notify activity updates
   whatsappClient.emitActivity = () => {
     pushActivity().catch(() => {});
     pushStatus().catch(() => {});
   };
 
   wss.on('connection', async (socket) => {
+    socket.on('error', () => {});
     try {
       const status = await whatsappClient.getPublicStatus();
       const activity = await getActivity();
-      socket.send(JSON.stringify({ type: 'status', data: status }));
-      socket.send(JSON.stringify({ type: 'activity', data: activity }));
+      if (socket.readyState === 1) {
+        socket.send(JSON.stringify({ type: 'status', data: status }));
+        socket.send(JSON.stringify({ type: 'activity', data: activity }));
+      }
     } catch {
       // ignore
     }
+  });
+
+  wss.on('error', (error) => {
+    console.error('[ws]', error.message);
   });
 
   app.get('/api/status', async (_req, res) => {
@@ -81,6 +91,9 @@ export function createServer() {
       const updates = {};
       if (typeof req.body?.dryRun === 'boolean') {
         updates.dryRun = req.body.dryRun;
+      }
+      if (typeof req.body?.deleteImages === 'boolean') {
+        updates.deleteImages = req.body.deleteImages;
       }
       const cfg = await saveAppConfig(updates);
       await pushStatus();
@@ -149,42 +162,50 @@ export function createServer() {
     }
   });
 
-  // Static frontend (production / npm start)
-  const distDir = config.webDistDir;
-  if (fs.existsSync(distDir)) {
-    app.use(express.static(distDir));
-    app.get('*', (req, res, next) => {
-      if (req.path.startsWith('/api') || req.path.startsWith('/ws')) {
-        return next();
-      }
-      res.sendFile(path.join(distDir, 'index.html'));
-    });
+  // Frontend: Vite em --dev, ou dist em produção
+  if (config.isDev) {
+    const { attachViteDev } = await import('./dev/vite.js');
+    await attachViteDev(app, server);
   } else {
-    app.get('/', (_req, res) => {
-      res
-        .status(200)
-        .type('html')
-        .send(
-          `<!doctype html><html><body style="font-family:system-ui;padding:2rem">
-          <h1>WhatsApp Service Filter</h1>
-          <p>Frontend ainda não foi buildado.</p>
-          <p>Em desenvolvimento, use <code>npm run dev</code> e abra o Vite.</p>
-          <p>Em produção: <code>npm run build && npm start</code></p>
-          </body></html>`,
-        );
-    });
+    const distDir = config.webDistDir;
+    if (fs.existsSync(distDir)) {
+      app.use(express.static(distDir));
+      app.get('*', (req, res, next) => {
+        if (req.path.startsWith('/api') || req.path.startsWith('/ws')) {
+          return next();
+        }
+        res.sendFile(path.join(distDir, 'index.html'));
+      });
+    } else {
+      app.get('/', (_req, res) => {
+        res
+          .status(200)
+          .type('html')
+          .send(
+            `<!doctype html><html><body style="font-family:system-ui;padding:2rem">
+            <h1>WhatsApp Service Filter</h1>
+            <p>Frontend ainda não foi buildado.</p>
+            <p>Em desenvolvimento: <code>npm run dev</code></p>
+            <p>Em produção: <code>npm run build && npm start</code></p>
+            </body></html>`,
+          );
+      });
+    }
   }
 
   return { app, server, pushStatus, pushActivity };
 }
 
-export function printBanner(port) {
+export function printBanner(port, { dev = false } = {}) {
   const line = '──────────────────────────────';
   console.log('');
   console.log('WhatsApp Service Filter');
   console.log(line);
   console.log('');
   console.log('✓ Servidor iniciado');
+  if (dev) {
+    console.log('✓ Frontend Vite (mesmo processo)');
+  }
   console.log('');
   console.log('Painel:');
   console.log(`http://localhost:${port}`);

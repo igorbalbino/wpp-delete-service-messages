@@ -1,13 +1,23 @@
 import makeWASocket, {
+  Browsers,
   DisconnectReason,
-  fetchLatestBaileysVersion,
   makeCacheableSignalKeyStore,
 } from '@whiskeysockets/baileys';
 import pino from 'pino';
 import { loadAuthState } from './auth.js';
 import { listGroups, resolveGroupName } from './groups.js';
-import { clearAuthDir, authDirHasCreds, getAppConfig } from '../storage/storage.js';
+import {
+  clearAuthDir,
+  clearSignalSessions,
+  authDirHasCreds,
+  getAppConfig,
+} from '../storage/storage.js';
 import { startMonitor, stopMonitor } from '../services/monitor.js';
+import {
+  rememberMessage,
+  getMessage,
+  clearMessageStore,
+} from './messageStore.js';
 
 const logger = pino({ level: 'silent' });
 
@@ -22,8 +32,12 @@ class WhatsAppClient {
     this.account = null;
     this.listeners = new Set();
     this.shouldReconnect = true;
-    this.connecting = false;
     this.intentionalDisconnect = false;
+    /** @type {ReturnType<typeof setTimeout> | null} */
+    this.reconnectTimer = null;
+    this.socketGeneration = 0;
+    /** @type {Promise<void> | null} */
+    this.startLock = null;
   }
 
   onChange(listener) {
@@ -63,32 +77,28 @@ class WhatsAppClient {
         ? { jid: appConfig.groupJid, name: appConfig.groupName }
         : null,
       dryRun: appConfig.dryRun,
+      deleteImages: appConfig.deleteImages === true,
       monitoring,
       hasSavedSession: await authDirHasCreds(),
     };
   }
 
   async connect({ forceQr = false } = {}) {
-    if (this.connecting) return this.getStatus();
     if (this.status === 'connected' && this.sock && !forceQr) {
       return this.getStatus();
     }
 
     this.intentionalDisconnect = false;
     this.shouldReconnect = true;
-    this.connecting = true;
 
     if (forceQr) {
+      this._clearReconnectTimer();
       await this._teardownSocket();
       await clearAuthDir();
+      clearMessageStore();
     }
 
-    try {
-      await this._startSocket();
-    } finally {
-      this.connecting = false;
-    }
-
+    await this._startSocket();
     return this.getStatus();
   }
 
@@ -99,93 +109,158 @@ class WhatsAppClient {
     this.intentionalDisconnect = false;
     try {
       await this._startSocket();
-    } catch {
+    } catch (error) {
+      console.error('[whatsapp] falha ao restaurar sessão:', error.message);
       this.status = 'disconnected';
       this.emit();
     }
   }
 
-  async _startSocket() {
-    const { state, saveCreds } = await loadAuthState();
-    const { version } = await fetchLatestBaileysVersion();
+  /** Renegocia sessões Signal (Bad MAC) sem pedir QR de novo. */
+  async resetSignalSessions() {
+    this._clearReconnectTimer();
+    await this._teardownSocket();
+    await clearSignalSessions();
+    clearMessageStore();
+    this.shouldReconnect = true;
+    this.intentionalDisconnect = false;
+    await this._startSocket();
+    return this.getStatus();
+  }
 
-    this.status = this.status === 'connected' ? 'reconnecting' : 'connecting';
+  _clearReconnectTimer() {
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+  }
+
+  async _startSocket() {
+    // Serializa starts — evita 2 sockets com a mesma auth (Bad MAC)
+    while (this.startLock) {
+      await this.startLock;
+    }
+
+    let release;
+    this.startLock = new Promise((resolve) => {
+      release = resolve;
+    });
+
+    try {
+      this._clearReconnectTimer();
+      await this._teardownSocket();
+
+      const generation = ++this.socketGeneration;
+      const { state, saveCreds } = await loadAuthState();
+
+      this.status =
+        this.status === 'connected' || this.status === 'reconnecting'
+          ? 'reconnecting'
+          : 'connecting';
+      this.qr = null;
+      this.emit();
+
+      const sock = makeWASocket({
+        auth: {
+          creds: state.creds,
+          keys: makeCacheableSignalKeyStore(state.keys, logger),
+        },
+        logger,
+        browser: Browsers.ubuntu('Chrome'),
+        printQRInTerminal: false,
+        syncFullHistory: false,
+        markOnlineOnConnect: false,
+        generateHighQualityLinkPreview: false,
+        getMessage,
+      });
+
+      this.sock = sock;
+
+      sock.ev.on('creds.update', saveCreds);
+
+      sock.ev.on('messages.upsert', ({ messages }) => {
+        for (const message of messages || []) {
+          rememberMessage(message);
+        }
+      });
+
+      sock.ev.on('connection.update', (update) => {
+        if (generation !== this.socketGeneration || this.sock !== sock) return;
+        this._onConnectionUpdate(sock, generation, update).catch((error) => {
+          console.error('[whatsapp] connection.update:', error.message);
+        });
+      });
+    } finally {
+      release();
+      this.startLock = null;
+    }
+  }
+
+  async _onConnectionUpdate(sock, generation, update) {
+    if (generation !== this.socketGeneration || this.sock !== sock) return;
+
+    const { connection, lastDisconnect, qr } = update;
+
+    if (qr) {
+      this.status = 'qr';
+      this.qr = qr;
+      this.account = null;
+      this.emit();
+    }
+
+    if (connection === 'open') {
+      this.status = 'connected';
+      this.qr = null;
+      this.account = this._readAccount(sock);
+      this.emit();
+      startMonitor(sock, () => this.emitActivity?.());
+      return;
+    }
+
+    if (connection !== 'close') return;
+
+    stopMonitor();
+    const statusCode = lastDisconnect?.error?.output?.statusCode;
+    const loggedOut = statusCode === DisconnectReason.loggedOut;
+    const restartRequired = statusCode === DisconnectReason.restartRequired;
+
+    if (this.intentionalDisconnect || loggedOut) {
+      this.status = 'disconnected';
+      this.qr = null;
+      this.account = null;
+      this.sock = null;
+      if (loggedOut && !this.intentionalDisconnect) {
+        await clearAuthDir();
+        clearMessageStore();
+      }
+      this.emit();
+      return;
+    }
+
+    if (!this.shouldReconnect) {
+      this.status = 'disconnected';
+      this.sock = null;
+      this.emit();
+      return;
+    }
+
+    this.status = 'reconnecting';
     this.qr = null;
     this.emit();
 
-    const sock = makeWASocket({
-      version,
-      auth: {
-        creds: state.creds,
-        keys: makeCacheableSignalKeyStore(state.keys, logger),
-      },
-      logger,
-      printQRInTerminal: false,
-      syncFullHistory: false,
-      markOnlineOnConnect: false,
-      generateHighQualityLinkPreview: false,
-    });
-
-    this.sock = sock;
-
-    sock.ev.on('creds.update', saveCreds);
-
-    sock.ev.on('connection.update', async (update) => {
-      const { connection, lastDisconnect, qr } = update;
-
-      if (qr) {
-        this.status = 'qr';
-        this.qr = qr;
-        this.account = null;
-        this.emit();
-      }
-
-      if (connection === 'open') {
-        this.status = 'connected';
-        this.qr = null;
-        this.account = this._readAccount(sock);
-        this.emit();
-        startMonitor(sock, () => this.emitActivity?.());
-      }
-
-      if (connection === 'close') {
-        stopMonitor();
-        const statusCode = lastDisconnect?.error?.output?.statusCode;
-        const loggedOut = statusCode === DisconnectReason.loggedOut;
-
-        if (this.intentionalDisconnect || loggedOut) {
+    const delayMs = restartRequired ? 500 : 2000;
+    this._clearReconnectTimer();
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      if (this.shouldReconnect && !this.intentionalDisconnect) {
+        this._startSocket().catch((error) => {
+          console.error('[whatsapp] reconnect falhou:', error.message);
           this.status = 'disconnected';
-          this.qr = null;
-          this.account = null;
-          this.sock = null;
-          if (loggedOut && !this.intentionalDisconnect) {
-            await clearAuthDir();
-          }
           this.emit();
-          return;
-        }
-
-        if (this.shouldReconnect) {
-          this.status = 'reconnecting';
-          this.qr = null;
-          this.emit();
-          setTimeout(() => {
-            if (this.shouldReconnect && !this.intentionalDisconnect) {
-              this._startSocket().catch(() => {
-                this.status = 'disconnected';
-                this.emit();
-              });
-            }
-          }, 2000);
-        } else {
-          this.status = 'disconnected';
-          this.sock = null;
-          this.emit();
-        }
+        });
       }
-    });
-
-    }
+    }, delayMs);
+  }
 
   _readAccount(sock) {
     const user = sock.user;
@@ -206,6 +281,7 @@ class WhatsAppClient {
   async disconnect() {
     this.intentionalDisconnect = true;
     this.shouldReconnect = false;
+    this._clearReconnectTimer();
     stopMonitor();
 
     try {
@@ -218,6 +294,7 @@ class WhatsAppClient {
 
     await this._teardownSocket();
     await clearAuthDir();
+    clearMessageStore();
 
     this.status = 'disconnected';
     this.qr = null;
@@ -228,16 +305,18 @@ class WhatsAppClient {
 
   async _teardownSocket() {
     stopMonitor();
-    if (this.sock) {
-      try {
-        this.sock.ev.removeAllListeners('connection.update');
-        this.sock.ev.removeAllListeners('creds.update');
-        this.sock.end?.(undefined);
-      } catch {
-        // ignore
-      }
-    }
+    const sock = this.sock;
     this.sock = null;
+    if (!sock) return;
+
+    try {
+      sock.ev.removeAllListeners('connection.update');
+      sock.ev.removeAllListeners('creds.update');
+      sock.ev.removeAllListeners('messages.upsert');
+      sock.end?.(undefined);
+    } catch {
+      // ignore
+    }
   }
 
   async getGroups() {

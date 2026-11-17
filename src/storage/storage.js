@@ -25,6 +25,7 @@ const defaultAppConfig = {
   groupJid: null,
   groupName: null,
   dryRun: config.dryRunDefault,
+  deleteImages: false,
 };
 
 let appConfigCache = null;
@@ -38,6 +39,7 @@ export async function getAppConfig() {
       ...stored,
       dryRun:
         typeof stored.dryRun === 'boolean' ? stored.dryRun : config.dryRunDefault,
+      deleteImages: stored.deleteImages === true,
     };
   }
   return { ...appConfigCache };
@@ -69,6 +71,8 @@ export async function addActivity(entry) {
     category: entry.category,
     action: entry.action,
     reason: entry.reason || null,
+    preview: entry.preview || null,
+    fromMe: Boolean(entry.fromMe),
   };
   activityCache = [item, ...list].slice(0, config.maxActivityItems);
   await writeJson(config.activityPath, activityCache);
@@ -80,6 +84,30 @@ export async function clearAuthDir() {
     await fs.rm(config.authDir, { recursive: true, force: true });
   } catch {
     // ignore
+  }
+}
+
+/**
+ * Remove sessões Signal corrompidas (Bad MAC) sem deslogar.
+ * Mantém creds.json — não precisa escanear QR de novo.
+ */
+export async function clearSignalSessions() {
+  try {
+    const entries = await fs.readdir(config.authDir);
+    await Promise.all(
+      entries
+        .filter(
+          (name) =>
+            name.startsWith('session-') ||
+            name.startsWith('sender-key-') ||
+            name.startsWith('sender-keys-')
+        )
+        .map((name) =>
+          fs.rm(path.join(config.authDir, name), { force: true }).catch(() => {})
+        )
+    );
+  } catch {
+    // ignore se a pasta ainda não existe
   }
 }
 

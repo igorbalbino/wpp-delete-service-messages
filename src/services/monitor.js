@@ -8,11 +8,27 @@ import {
   deleteMessageForEveryone,
   extractMessageText,
   isGroupJid,
+  isImageMessage,
 } from '../whatsapp/messages.js';
 
 let activeSock = null;
 let handler = null;
 let onActivity = null;
+
+const PREVIEW_MAX = 120;
+
+function previewText(text) {
+  const cleaned = String(text || '').replace(/\s+/g, ' ').trim();
+  if (!cleaned) return '';
+  if (cleaned.length <= PREVIEW_MAX) return cleaned;
+  return `${cleaned.slice(0, PREVIEW_MAX - 1)}…`;
+}
+
+async function recordActivity(entry) {
+  const activity = await addActivity(entry);
+  onActivity?.(activity);
+  return activity;
+}
 
 export function startMonitor(sock, activityCallback) {
   stopMonitor();
@@ -28,6 +44,7 @@ export function startMonitor(sock, activityCallback) {
   };
 
   sock.ev.on('messages.upsert', handler);
+  console.log('[monitor] ativo — aguardando mensagens do grupo');
 }
 
 export function stopMonitor() {
@@ -57,7 +74,6 @@ async function handleUpsert({ type, messages }) {
 
 async function processMessage(message, appConfig) {
   if (!message?.key) return;
-  if (message.key.fromMe) return;
 
   const remoteJid = message.key.remoteJid;
   if (!isGroupJid(remoteJid)) return;
@@ -66,52 +82,117 @@ async function processMessage(message, appConfig) {
   // Ignorar eventos que não são mensagens de conteúdo
   if (message.messageStubType) return;
 
+  const fromMe = Boolean(message.key.fromMe);
+
+  // Foto: apaga na hora, sem classificar legenda nem conteúdo.
+  if (appConfig.deleteImages && isImageMessage(message)) {
+    const caption = previewText(extractMessageText(message));
+    const preview = caption || '[imagem]';
+
+    if (fromMe) {
+      await recordActivity({
+        category: 'image',
+        action: 'kept',
+        reason: 'Mensagem própria — apenas registrada no painel',
+        preview,
+        fromMe: true,
+      });
+      return;
+    }
+
+    if (appConfig.dryRun) {
+      await recordActivity({
+        category: 'image',
+        action: 'ignored_dry_run',
+        reason: 'Imagem identificada — exclusão automática (DRY RUN)',
+        preview,
+        fromMe: false,
+      });
+      return;
+    }
+
+    try {
+      await deleteMessageForEveryone(activeSock, message);
+      await recordActivity({
+        category: 'image',
+        action: 'removed',
+        reason: 'Imagem identificada e removida sem analisar o conteúdo',
+        preview,
+        fromMe: false,
+      });
+    } catch (error) {
+      await recordActivity({
+        category: 'image',
+        action: 'ignored',
+        reason: `Falha ao remover: ${error.message}`,
+        preview,
+        fromMe: false,
+      });
+    }
+    return;
+  }
+
   const text = extractMessageText(message);
   if (!text) return;
 
+  const preview = previewText(text);
   const result = detectService(text);
+
+  // Mensagens próprias: mostra no painel, nunca apaga
+  if (fromMe) {
+    await recordActivity({
+      category: result.category,
+      action: 'kept',
+      reason: 'Mensagem própria — apenas registrada no painel',
+      preview,
+      fromMe: true,
+    });
+    return;
+  }
+
   const shouldDelete =
     result.isService &&
     result.confidence >= config.confidenceThreshold;
 
   if (!shouldDelete) {
-    // Evita poluir o histórico com mensagens irrelevantes
-    if (['job', 'rental', 'sale', 'purchase', 'service'].includes(result.category)) {
-      const activity = await addActivity({
-        category: result.category,
-        action: 'ignored',
-        reason: result.reason,
-      });
-      onActivity?.(activity);
-    }
+    await recordActivity({
+      category: result.category,
+      action: 'kept',
+      reason: result.reason,
+      preview,
+      fromMe: false,
+    });
     return;
   }
 
   if (appConfig.dryRun) {
-    const activity = await addActivity({
-      category: 'service',
+    await recordActivity({
+      category: result.category,
       action: 'ignored_dry_run',
       reason: result.reason,
+      preview,
+      fromMe: false,
     });
-    onActivity?.(activity);
     return;
   }
 
   try {
     await deleteMessageForEveryone(activeSock, message);
-    const activity = await addActivity({
-      category: 'service',
+    await recordActivity({
+      category: result.category,
       action: 'removed',
       reason: result.reason,
+      preview,
+      fromMe: false,
     });
-    onActivity?.(activity);
   } catch (error) {
-    const activity = await addActivity({
-      category: 'service',
+    await recordActivity({
+      category: result.category,
       action: 'ignored',
       reason: `Falha ao remover: ${error.message}`,
+      preview,
+      fromMe: false,
     });
-    onActivity?.(activity);
   }
 }
 

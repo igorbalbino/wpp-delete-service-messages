@@ -3,13 +3,17 @@ import { createServer, printBanner } from './server.js';
 import { whatsappClient } from './whatsapp/client.js';
 
 async function main() {
-  const { server } = createServer();
+  const { server } = await createServer();
 
-  server.listen(config.port, async () => {
-    printBanner(config.port);
-    // Restaura sessão salva sem exigir QR
-    await whatsappClient.tryRestoreSession();
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(config.port, resolve);
   });
+
+  printBanner(config.port, { dev: config.isDev });
+
+  // Restaura sessão salva sem exigir QR
+  await whatsappClient.tryRestoreSession();
 }
 
 main().catch((error) => {

@@ -179,6 +179,81 @@ function scoreCategory(hits, weight = 0.35) {
 }
 
 /**
+ * Sinais de anúncio comercial. Um indício sozinho e genérico não chega a 0,8.
+ * Link de loja, chamada de pedido ou combinação explícita de oferta, sim.
+ * @returns {{ score: number, reasons: string[] }}
+ */
+export function scoreAdvertisement(rawText) {
+  const raw = String(rawText || '');
+  const normalized = normalizeText(raw);
+  let score = 0;
+  const reasons = [];
+
+  const add = (points, reason) => {
+    if (points <= 0) return;
+    score += points;
+    if (reason && !reasons.includes(reason)) reasons.push(reason);
+  };
+
+  // Afiliado / vitrine. "meli." basta, como pedido.
+  if (/meli\./i.test(raw) || /mercadolivre\.com/i.test(raw)) {
+    add(0.92, 'link de produto');
+  }
+
+  if (/99app\.com|brendi\.com\.br|ifood\.com|rappi\.com/i.test(raw)) {
+    add(0.88, 'link de pedido');
+  }
+
+  if (/\bagende\s+sua\s+aula\b/.test(normalized)) add(0.86, 'agendamento de aula');
+  if (/\bfaca\s+(?:ja\s+)?seu\s+pedido\b/.test(normalized)) add(0.86, 'chamada para pedido');
+  if (/\bpeca\s+seu\s+(?:lanche|pedido|combo|hamburguer|burguer|burger)\b/.test(normalized)) {
+    add(0.86, 'chamada para pedido');
+  }
+
+  // Oferta de aula: cada frase fica abaixo do corte; juntas, passam.
+  if (/\baulas?\s+(?:sao\s+)?personalizadas\b/.test(normalized)) add(0.55, 'oferta de aula');
+  if (/\bquer\s+aprender\s+a\s+(?:cantar|tocar)\b/.test(normalized)) add(0.45, 'oferta de aula');
+
+  if (/\bpor\s+apenas\s+r\s*\d/.test(normalized)) add(0.55, 'preço promocional');
+  if (/\bdelivery\s+ou\s+retirada\b/.test(normalized)) add(0.4, 'delivery');
+  if (/\bpagamento\s+fa[cl]icitado\b/.test(normalized)) add(0.55, 'pagamento facilitado');
+
+  const trip =
+    /\b(reveillon|turismo|excursao|pacote)\b/.test(normalized) &&
+    /\bsaida\b/.test(normalized) &&
+    /\bretorno\b/.test(normalized);
+  if (trip) add(0.5, 'pacote de viagem');
+
+  // Higienização: a frase pronta basta; os pedaços soltos ficam abaixo do corte.
+  if (/\bhigienizacao\s+profissional\b/.test(normalized)) add(0.88, 'higienização profissional');
+  if (/\brenove\s+seu\s+(sofa|estofado|colchao)\b/.test(normalized)) add(0.5, 'oferta de higienização');
+  if (/\bremocao\s+de\s+manchas\b/.test(normalized)) add(0.4, 'oferta de higienização');
+
+  // Catálogo com tabela. "nossos serviços" ou um preço isolado não chegam a 0,8.
+  const priceCount = normalized.match(/\br\s+\d{1,4}\s+\d{2}\b/g)?.length || 0;
+  if (/\bnossos\s+servicos\b/.test(normalized) && priceCount >= 2) {
+    add(0.9, 'tabela de serviços');
+  }
+  if (/\bnossos\s+servicos\b/.test(normalized) && /\borcamentos?\b/.test(normalized)) {
+    add(0.86, 'catálogo de serviços');
+  }
+
+  // Convite de grupo só vira anúncio com cara de cupom/oferta. Link de grupo sozinho não conta.
+  const dealWords =
+    /\b(cupons?|descontos?)\b/.test(normalized) && /\b(promocoes|ofertas)\b/.test(normalized);
+  const storeHits = ['mercado livre', 'amazon', 'shopee'].filter((store) =>
+    normalized.includes(store),
+  ).length;
+  if (/chat\.whatsapp\.com/i.test(raw) && dealWords) add(0.9, 'grupo de ofertas');
+  else if (storeHits >= 2 && dealWords) add(0.86, 'ofertas de loja');
+
+  return {
+    score: Math.min(0.98, score),
+    reasons,
+  };
+}
+
+/**
  * @param {string} text
  * @returns {{ isService: boolean, confidence: number, category: string, reason: string }}
  */
@@ -191,6 +266,18 @@ export function detectService(text) {
       confidence: 0,
       category: 'unknown',
       reason: 'Texto insuficiente para classificação',
+    };
+  }
+
+  const ad = scoreAdvertisement(text);
+  if (ad.score >= 0.8) {
+    return {
+      isService: true,
+      confidence: Number(ad.score.toFixed(2)),
+      category: 'anuncio',
+      reason: ad.reasons.length
+        ? `Anúncio identificado (${ad.reasons.join(', ')})`
+        : 'Anúncio identificado',
     };
   }
 
